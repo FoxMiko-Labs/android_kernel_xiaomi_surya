@@ -7,6 +7,16 @@
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
+ *
+ * Surya optimisations:
+ *  - Tuned defaults for smooth daily use + gaming (lower up_rate, higher
+ *    hispeed_load, pl enabled)
+ *  - Screen-off deep-sleep mode: drastically raise rate limits and drop
+ *    hispeed so the governor is very conservative when display is off
+ *  - Screen-on performance burst: on display unblank, force max frequency
+ *    briefly so the first frame renders without a ramp-up stutter, then
+ *    restore normal tunables
+ *  - DRM notifier integration via msm_drm_notify
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -17,6 +27,8 @@
 #include <linux/slab.h>
 #include <trace/events/power.h>
 #include <linux/sched/sysctl.h>
+#include <linux/msm_drm_notify.h>
+#include <linux/notifier.h>
 #include "sched.h"
 
 #define SUGOV_KTHREAD_PRIORITY	50
@@ -88,6 +100,208 @@ struct sugov_cpu {
 static DEFINE_PER_CPU(struct sugov_cpu, sugov_cpu);
 static unsigned int stale_ns;
 static DEFINE_PER_CPU(struct sugov_tunables *, cached_tunables);
+
+/* ---- Screen-state tracking -------------------------------------------- */
+
+/*
+ * Active tunables for normal (screen-on) operation.
+ * These are the "performance" defaults tuned for smooth UI + gaming.
+ *
+ * up_rate_limit_us:   500 µs  — react to load spikes quickly
+ * down_rate_limit_us: 2000 µs — stay at higher freq a bit longer after a burst
+ *                               to avoid stutter on rapid sequential frames
+ * hispeed_load:       80 %    — boost to hispeed_freq when avg load > 80 %
+ * hispeed_freq:       0       — 0 means policy max (set per-cluster at start)
+ * pl:                 true    — honour pipeline-latency boost hints from WALT
+ */
+#define SUGOV_UP_RATE_NORMAL_US		500U
+#define SUGOV_DOWN_RATE_NORMAL_US	2000U
+#define SUGOV_HISPEED_LOAD_NORMAL	80U
+#define SUGOV_PL_NORMAL			true
+
+/*
+ * Deep-sleep tunables applied while the screen is off.
+ * Goal: very conservative ramp-up/down so idle cores stay at minimum
+ * frequency and battery drain is minimised.
+ *
+ * up_rate_limit_us:   20000 µs (20 ms) — very slow ramp up
+ * down_rate_limit_us:  1000 µs          — quick ramp down to save power
+ * hispeed_load:        95 %             — almost never boost to hispeed
+ */
+#define SUGOV_UP_RATE_SLEEP_US		20000U
+#define SUGOV_DOWN_RATE_SLEEP_US	1000U
+#define SUGOV_HISPEED_LOAD_SLEEP	95U
+#define SUGOV_PL_SLEEP			false
+
+/*
+ * Duration of the "performance burst" applied on screen-on.
+ * The governor forces a re-evaluation immediately (last_freq_update_time = 0)
+ * so the first frame after unblank is rendered at full speed without waiting
+ * for the normal rate-limit window.  No explicit burst timer is needed.
+ */
+
+/* Global screen-state flag: true = display off */
+static bool sugov_screen_off;
+static DEFINE_SPINLOCK(sugov_screen_lock);
+
+/* Notifier block registered with msm_drm */
+static struct notifier_block sugov_drm_notifier;
+
+/*
+ * sugov_apply_screen_on_tunables() / sugov_apply_screen_off_tunables()
+ *
+ * Walk every registered cpufreq policy and update its schedutil tunables
+ * to match the current screen state.  Called from the DRM notifier which
+ * runs in a non-atomic context so taking policy locks is safe.
+ */
+static void sugov_apply_screen_off_tunables(void)
+{
+	struct cpufreq_policy *policy;
+	unsigned int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct sugov_policy *sg_policy;
+		struct sugov_tunables *tunables;
+		unsigned long flags;
+
+		policy = cpufreq_cpu_get(cpu);
+		if (!policy)
+			continue;
+
+		/* Only visit the first CPU of each shared policy */
+		if (policy->cpu != cpu) {
+			cpufreq_cpu_put(policy);
+			continue;
+		}
+
+		sg_policy = policy->governor_data;
+		if (!sg_policy || !sg_policy->tunables) {
+			cpufreq_cpu_put(policy);
+			continue;
+		}
+
+		tunables = sg_policy->tunables;
+
+		/* Update tunables atomically */
+		raw_spin_lock_irqsave(&sg_policy->update_lock, flags);
+		tunables->up_rate_limit_us   = SUGOV_UP_RATE_SLEEP_US;
+		tunables->down_rate_limit_us = SUGOV_DOWN_RATE_SLEEP_US;
+		tunables->hispeed_load       = SUGOV_HISPEED_LOAD_SLEEP;
+		tunables->pl                 = SUGOV_PL_SLEEP;
+		sg_policy->up_rate_delay_ns   = SUGOV_UP_RATE_SLEEP_US   * NSEC_PER_USEC;
+		sg_policy->down_rate_delay_ns = SUGOV_DOWN_RATE_SLEEP_US  * NSEC_PER_USEC;
+		sg_policy->min_rate_limit_ns  = min(sg_policy->up_rate_delay_ns,
+						    sg_policy->down_rate_delay_ns);
+		raw_spin_unlock_irqrestore(&sg_policy->update_lock, flags);
+
+		cpufreq_cpu_put(policy);
+	}
+	pr_debug("schedutil: screen-off deep-sleep tunables applied\n");
+}
+
+static void sugov_apply_screen_on_tunables(void)
+{
+	struct cpufreq_policy *policy;
+	unsigned int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct sugov_policy *sg_policy;
+		struct sugov_tunables *tunables;
+		unsigned long flags;
+
+		policy = cpufreq_cpu_get(cpu);
+		if (!policy)
+			continue;
+
+		if (policy->cpu != cpu) {
+			cpufreq_cpu_put(policy);
+			continue;
+		}
+
+		sg_policy = policy->governor_data;
+		if (!sg_policy || !sg_policy->tunables) {
+			cpufreq_cpu_put(policy);
+			continue;
+		}
+
+		tunables = sg_policy->tunables;
+
+		raw_spin_lock_irqsave(&sg_policy->update_lock, flags);
+		tunables->up_rate_limit_us   = SUGOV_UP_RATE_NORMAL_US;
+		tunables->down_rate_limit_us = SUGOV_DOWN_RATE_NORMAL_US;
+		tunables->hispeed_load       = SUGOV_HISPEED_LOAD_NORMAL;
+		tunables->pl                 = SUGOV_PL_NORMAL;
+		sg_policy->up_rate_delay_ns   = SUGOV_UP_RATE_NORMAL_US   * NSEC_PER_USEC;
+		sg_policy->down_rate_delay_ns = SUGOV_DOWN_RATE_NORMAL_US  * NSEC_PER_USEC;
+		sg_policy->min_rate_limit_ns  = min(sg_policy->up_rate_delay_ns,
+						    sg_policy->down_rate_delay_ns);
+		/*
+		 * Performance burst: force the governor to re-evaluate
+		 * immediately so that the first frame after unblank does not
+		 * have to wait for the normal rate-limit window.
+		 */
+		sg_policy->last_freq_update_time = 0;
+		sg_policy->need_freq_update      = true;
+		raw_spin_unlock_irqrestore(&sg_policy->update_lock, flags);
+
+		/*
+		 * Request max frequency immediately (fast-switch path).
+		 * This ensures the first wakeup frame is rendered at full
+		 * speed regardless of WALT utilisation history.
+		 */
+		if (policy->fast_switch_enabled)
+			cpufreq_driver_fast_switch(policy, policy->cpuinfo.max_freq);
+
+		cpufreq_cpu_put(policy);
+	}
+	pr_debug("schedutil: screen-on performance tunables applied\n");
+}
+
+static int sugov_drm_notifier_cb(struct notifier_block *nb,
+				 unsigned long event, void *data)
+{
+	struct msm_drm_notifier *evdata = data;
+	unsigned long flags;
+	int *blank;
+
+	if (!evdata || !evdata->data)
+		return NOTIFY_OK;
+
+	/* We care about the post-blank event (panel is fully on/off) */
+	if (event != MSM_DRM_EVENT_BLANK)
+		return NOTIFY_OK;
+
+	/* Only react to primary display */
+	if (evdata->id != MSM_DRM_PRIMARY_DISPLAY)
+		return NOTIFY_OK;
+
+	blank = evdata->data;
+
+	spin_lock_irqsave(&sugov_screen_lock, flags);
+
+	if (*blank == MSM_DRM_BLANK_POWERDOWN) {
+		/* Screen going off */
+		if (!sugov_screen_off) {
+			sugov_screen_off = true;
+			spin_unlock_irqrestore(&sugov_screen_lock, flags);
+			sugov_apply_screen_off_tunables();
+			return NOTIFY_OK;
+		}
+	} else if (*blank == MSM_DRM_BLANK_UNBLANK) {
+		/* Screen coming on */
+		if (sugov_screen_off) {
+			sugov_screen_off = false;
+			spin_unlock_irqrestore(&sugov_screen_lock, flags);
+			sugov_apply_screen_on_tunables();
+			return NOTIFY_OK;
+		}
+	}
+
+	spin_unlock_irqrestore(&sugov_screen_lock, flags);
+	return NOTIFY_OK;
+}
+
+/* --------------------------------------------------------------------- */
 
 /************************ Governor internals ***********************/
 
@@ -380,8 +594,17 @@ static bool sugov_cpu_is_busy(struct sugov_cpu *sg_cpu)
 static inline bool sugov_cpu_is_busy(struct sugov_cpu *sg_cpu) { return false; }
 #endif /* CONFIG_NO_HZ_COMMON */
 
+/*
+ * NL_RATIO: when new-load (recently-migrated tasks) exceeds this fraction of
+ * cpu_util, snap to max frequency.  Lower = more aggressive inter-cluster
+ * migration boost.  75 % is the upstream default; keep it for now.
+ *
+ * DEFAULT_HISPEED_LOAD: percentage of avg_cap above which we jump to
+ * hispeed_freq.  80 % gives a good balance — the CPU boosts early enough to
+ * avoid frame drops without burning power at idle.
+ */
 #define NL_RATIO 75
-#define DEFAULT_HISPEED_LOAD 90
+#define DEFAULT_HISPEED_LOAD 80
 static void sugov_walt_adjust(struct sugov_cpu *sg_cpu, unsigned long *util,
 			      unsigned long *max)
 {
@@ -972,12 +1195,16 @@ static int sugov_init(struct cpufreq_policy *policy)
 		goto stop_kthread;
 	}
 
-	tunables->up_rate_limit_us =
-				cpufreq_policy_transition_delay_us(policy);
-	tunables->down_rate_limit_us =
-				cpufreq_policy_transition_delay_us(policy);
-	tunables->hispeed_load = DEFAULT_HISPEED_LOAD;
-	tunables->hispeed_freq = 0;
+	/*
+	 * Defaults: use the optimised screen-on values so the governor is
+	 * already in the right state at boot.  The DRM notifier will
+	 * switch to deep-sleep values when the display turns off.
+	 */
+	tunables->up_rate_limit_us   = SUGOV_UP_RATE_NORMAL_US;
+	tunables->down_rate_limit_us = SUGOV_DOWN_RATE_NORMAL_US;
+	tunables->hispeed_load       = DEFAULT_HISPEED_LOAD;
+	tunables->hispeed_freq       = 0;
+	tunables->pl                 = SUGOV_PL_NORMAL;
 
 	policy->governor_data = sg_policy;
 	sg_policy->tunables = tunables;
@@ -1132,6 +1359,24 @@ struct cpufreq_governor *cpufreq_default_governor(void)
 
 static int __init sugov_register(void)
 {
-	return cpufreq_register_governor(&schedutil_gov);
+	int ret;
+
+	ret = cpufreq_register_governor(&schedutil_gov);
+	if (ret)
+		return ret;
+
+	/*
+	 * Register for DRM panel events so we can switch between
+	 * deep-sleep (screen-off) and performance (screen-on) tunables
+	 * automatically.
+	 */
+	sugov_drm_notifier.notifier_call = sugov_drm_notifier_cb;
+	sugov_drm_notifier.priority = 0;
+	ret = msm_drm_register_client(&sugov_drm_notifier);
+	if (ret)
+		pr_warn("schedutil: failed to register DRM notifier (%d), "
+			"screen-state switching disabled\n", ret);
+
+	return 0;
 }
 fs_initcall(sugov_register);
