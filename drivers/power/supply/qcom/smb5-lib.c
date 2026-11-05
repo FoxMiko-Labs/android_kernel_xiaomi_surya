@@ -1531,7 +1531,7 @@ static int set_sdp_current(struct smb_charger *chg, int icl_ua)
 
 #ifdef CONFIG_FORCE_FAST_CHARGE
 	if (force_fast_charge > 0 && icl_ua == USBIN_500MA)
-		icl_ua = USBIN_900MA;
+		icl_ua = (force_fast_charge == 2) ? USBIN_1000MA : USBIN_900MA;
 #endif
 
 	/* power source is SDP */
@@ -2880,37 +2880,75 @@ int smblib_set_prop_system_temp_level(struct smb_charger *chg,
 
 	system_temp_level = val->intval;
 
-	pr_info("%s val=%d, chg->system_temp_level=%d, LctThermal=%d, lct_backlight_off= %d, IsInCall=%d \n " 
-		,__FUNCTION__,val->intval,chg->system_temp_level, LctThermal, lct_backlight_off, LctIsInCall);
+	pr_debug("%s val=%d, chg->system_temp_level=%d, LctThermal=%d, lct_backlight_off=%d, IsInCall=%d\n",
+		__FUNCTION__, val->intval, chg->system_temp_level, LctThermal,
+		lct_backlight_off, LctIsInCall);
 
-	if (LctThermal == 0) { //from therml-engine always store lvl_sel
+	if (LctThermal == 0) { /* from thermal-engine always store lvl_sel */
 		lct_therm_lvl_reserved.intval = val->intval;
 	}
 
-	/*backlight off and not-incall*/
-	if ((lct_backlight_off) && (LctIsInCall == 0) && (val->intval > LCT_THERM_LCDOFF_LEVEL)) {
-		pr_info("leve ignored:backlight_off:%d level:%d",lct_backlight_off,val->intval);
-		return 0;
+	/*
+	 * Screen-off optimisation: when the display is off and not in a call,
+	 * cap the effective thermal level at LCT_THERM_LCDOFF_LEVEL (defined
+	 * in smb5-lib.h and kept < thermal_levels).  We clamp to the cap
+	 * rather than returning early with no action, so that the level is
+	 * actually applied — the previous early-return left the FCC vote
+	 * unchanged which could leave a stale high throttle value in place.
+	 */
+	if ((lct_backlight_off) && (LctIsInCall == 0)) {
+		if (val->intval > LCT_THERM_LCDOFF_LEVEL) {
+			system_temp_level = LCT_THERM_LCDOFF_LEVEL;
+			pr_debug("screen-off cap: requested=%d capped=%d\n",
+				 val->intval, system_temp_level);
+		}
 	}
 
-	if ((LctIsInCall == 1) && (val->intval != LCT_THERM_CALL_LEVEL)) {
-		pr_info("leve ignored:LctIsInCall:%d level:%d",LctIsInCall,val->intval);
-		return 0;
+	/*
+	 * In-call optimisation: during a phone call only honour the
+	 * dedicated call thermal level.  All other requests are clamped
+	 * to the call level to keep FCC stable and avoid modem interference.
+	 */
+	if (LctIsInCall == 1) {
+		system_temp_level = LCT_THERM_CALL_LEVEL;
+		pr_debug("in-call cap: requested=%d effective=%d\n",
+			 val->intval, system_temp_level);
 	}
 
 	if (bypass_charging) {
-         	if (chg->thermal_levels - 2 > system_temp_level) system_temp_level = chg->thermal_levels-2;
-         	if (system_temp_level < 0) system_temp_level = 0;
-         	pr_info("%s limited charging enabled %d",__FUNCTION__, system_temp_level);
-     	} else if (system_temp_level > 0) {
-         	pr_info("%s charging enabled, but thermal limited %d",__FUNCTION__, system_temp_level);
-     	}
+		/*
+		 * When bypass (limited) charging is active, floor the
+		 * thermal level to thermal_levels - 2 so that we always
+		 * apply some charging-current mitigation rather than
+		 * allowing full current.
+		 */
+		if (system_temp_level < chg->thermal_levels - 2)
+			system_temp_level = chg->thermal_levels - 2;
+		if (system_temp_level < 0)
+			system_temp_level = 0;
+		pr_info("%s: bypass/limited charging, effective level=%d\n",
+			__FUNCTION__, system_temp_level);
+	}
 
-        chg->system_temp_level = val->intval;
-        pr_info("%s intval:%d system temp level:%d thermal_levels:%d",
-                __FUNCTION__,val->intval,chg->system_temp_level,chg->thermal_levels);
+	/* Clamp to valid range (defensive) */
+	if (system_temp_level >= chg->thermal_levels)
+		system_temp_level = chg->thermal_levels - 1;
 
-        if (chg->system_temp_level >= chg->thermal_levels)
+	/*
+	 * Store the *requested* level (val->intval) in chg so that user-space
+	 * reads back the value that was written, not the clamped internal one.
+	 */
+	chg->system_temp_level = val->intval;
+	pr_info("%s: intval=%d effective_level=%d thermal_levels=%d\n",
+		__FUNCTION__, val->intval, system_temp_level, chg->thermal_levels);
+
+	/*
+	 * Only suspend charging when thermal-engine explicitly requests the
+	 * maximum level (thermal_levels itself, one past the last valid index).
+	 * Previously any level >= thermal_levels (e.g. due to LCT cap mismatch)
+	 * would suspend; now we only suspend on an exact max request.
+	 */
+	if (val->intval >= chg->thermal_levels)
 		return vote(chg->chg_disable_votable,
 			THERMAL_DAEMON_VOTER, true, 0);
 

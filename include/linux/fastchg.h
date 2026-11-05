@@ -17,6 +17,12 @@
 #ifndef _LINUX_FASTCHG_H
 #define _LINUX_FASTCHG_H
 
+/*
+ * force_fast_charge:
+ *   0 - disabled  (stock SDP 500 mA)
+ *   1 - boost     (SDP → 900 mA)
+ *   2 - max boost (SDP → 1000 mA / CDP-class current)
+ */
 extern int force_fast_charge;
 
 #endif

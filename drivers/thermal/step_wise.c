@@ -102,7 +102,14 @@ static unsigned long get_target_state(struct thermal_instance *instance,
 				next_target = THERMAL_NO_TARGET;
 		} else {
 			if (!throttle) {
-				next_target = cur_state - 1;
+				/*
+				 * When temperature is dropping, allow releasing
+				 * 2 cooling steps at once so that performance
+				 * is restored more quickly after a thermal event.
+				 * Cap at instance->lower to avoid under-shooting.
+				 */
+				next_target = (cur_state >= 2) ?
+					      (cur_state - 2) : instance->lower;
 				if (next_target > instance->upper)
 					next_target = instance->upper;
 			}

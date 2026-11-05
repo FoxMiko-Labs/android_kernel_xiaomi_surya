@@ -133,7 +133,15 @@ enum print_reason {
 #define CC_UN_COMPLIANT_START_DELAY_MS	700
 
 /* lct thermal */
-#define LCT_THERM_CALL_LEVEL		14
+/*
+ * LCT_THERM_CALL_LEVEL and LCT_THERM_LCDOFF_LEVEL must be < thermal_levels
+ * (the number of entries in qcom,thermal-mitigation).  The thermal-mitigation
+ * table in atoll-qrd.dtsi now has 16 entries (indices 0–15), so these values
+ * are safe.  Screen-off charging is capped at index 11 (1500 mA) and in-call
+ * charging uses index 13 (1000 mA) which avoids accidental charging suspension
+ * that occurred with the old 8-entry table where index 11 >= thermal_levels.
+ */
+#define LCT_THERM_CALL_LEVEL		13
 #define LCT_THERM_LCDOFF_LEVEL		11
 
 #ifdef CONFIG_BATT_VERIFY_BY_DS28E16
@@ -155,18 +163,34 @@ enum hvdcp3_type {
 #define SDP_100_MA			100000
 #define SDP_CURRENT_UA			500000
 #define CDP_CURRENT_UA			1500000
-#define DCP_CURRENT_UA			1800000 //HTH-99130 set DCP CURRENT TO 1.8A
+/*
+ * DCP_CURRENT_UA: Input Current Limit for a standard DCP charger.
+ * USB Battery Charging spec allows up to 1.5 A; most OEM DCP bricks can
+ * deliver more.  Keep at 1800 mA — aggressive enough to charge at ~9 W on
+ * a plain 5 V DCP while staying within what the Qualcomm AICL can negotiate
+ * safely without collapsing the input voltage.
+ */
+#define DCP_CURRENT_UA			1800000
 #define FLOAT_CURRENT_UA		1000000
 #define HVDCP_CURRENT_UA		3000000
-#define HVDCP_CLASS_B_CURRENT_UA		3100000
-#define HVDCP2_CURRENT_UA		1500000
+#define HVDCP_CLASS_B_CURRENT_UA	3100000
+/*
+ * HVDCP2_CURRENT_UA: ICL for QC 2.0 adapters (9 V / 12 V output).
+ * At 9 V the adapter delivers 18 W at 2 A.  Keep at 2 A — matches the
+ * Xiaomi 18 W QC2 brick capability.
+ */
+#define HVDCP2_CURRENT_UA		2000000
 #define HVDCP_START_CURRENT_UA		1000000
 #define HVDCP_START_CURRENT_UA_FOR_BQ	500000
 #define SUSPEND_CURRENT_UA		2000
 #define TYPEC_DEFAULT_CURRENT_UA	900000
 #define TYPEC_MEDIUM_CURRENT_UA		1500000
 #define TYPEC_HIGH_CURRENT_UA		3000000
-#define HVDCP3p5_40W_CURRENT_UA                4500000
+/*
+ * HVDCP3p5_40W_CURRENT_UA: ICL for QC3.5 40 W adapters.
+ * At VBUS ~= 9 V the adapter can source 4.5 A → 40.5 W.
+ */
+#define HVDCP3p5_40W_CURRENT_UA		4500000
 #define DCIN_ICL_MIN_UA			100000
 #define DCIN_ICL_MAX_UA			1500000
 #define DCIN_ICL_STEP_UA		100000

@@ -33,7 +33,7 @@
 #define PD_SRC_PDO_TYPE_AUGMENTED	3
 
 #define BATT_MAX_CHG_VOLT		4450
-#define BATT_FAST_CHG_CURR		6000
+#define BATT_FAST_CHG_CURR		6100
 #define	BUS_OVP_THRESHOLD		12000
 #define	BUS_OVP_ALARM_THRESHOLD		9500
 
@@ -62,7 +62,15 @@ static struct pdpm_config pm_config = {
 	.bus_curr_lp_lmt		= BAT_CURR_LOOP_LMT >> 1,
 	.bus_curr_compensate	= 0,
 
-	.fc2_taper_current		= 2300,
+	/*
+	 * fc2_taper_current: the charge-pump (CP) algorithm exits to the
+	 * SW charger when ibat falls below this threshold (mA).
+	 * Lowering from 2000 mA to 1200 mA keeps the CP active deeper into
+	 * the CV phase, avoiding premature handover to the slower main
+	 * charger path.  1200 mA is safely above the battery's EOC current
+	 * so the CP does not fight the termination logic.
+	 */
+	.fc2_taper_current		= 1200,
 	.fc2_steps			= 1,
 
 	.min_adapter_volt_required	= 10000,

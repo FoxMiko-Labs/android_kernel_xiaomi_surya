@@ -300,12 +300,71 @@
 	qcom,sw-jeita-enable;
 	qcom,fcc-stepping-enable;
 	qcom,suspend-input-on-debug-batt;
-	qcom,sec-charger-config = <1>;
-	qcom,thermal-mitigation = <4200000 3500000 3000000
-			2500000 2000000 1500000 1000000 500000>;
+	/*
+	 * sec-charger-config = 0: no secondary charger (SMB1390 disabled on
+	 * Surya; BQ2597x CP is managed by pd_policy_manager independently).
+	 * Using config=1 with SMB1390 absent prevents the main charger from
+	 * waiting for a secondary that never comes up, which would stall FCC
+	 * ramp-up.
+	 */
+	qcom,sec-charger-config = <0>;
+	/*
+	 * 16-entry thermal-mitigation table (µA).  Indices 0–15 must cover
+	 * the full range referenced by LCT_THERM_LCDOFF_LEVEL (11) and
+	 * LCT_THERM_CALL_LEVEL (13) defined in smb5-lib.h.  The previous
+	 * 8-entry table caused any thermal level >= 8 to immediately suspend
+	 * charging because the index exceeded thermal_levels, even though
+	 * screen-off and in-call logic expected higher indices to still allow
+	 * reduced (not suspended) current.
+	 */
+	qcom,thermal-mitigation = <6000000 5500000 5000000 4500000
+				   4200000 3800000 3500000 3200000
+				   3000000 2500000 2000000 1500000
+				   1200000 1000000 700000  500000>;
 	dpdm-supply = <&qusb_phy0>;
 	qcom,charger-temp-max = <800>;
 	qcom,smb-temp-max = <800>;
+	qcom,fcc-step-delay-ms = <100>;
+	qcom,fcc-step-size-ua = <100000>;
+	qcom,disable-sw-thermal-regulation;
+	qcom,disable-fcc-restriction;
+	qcom,smb-internal-pull-kohm = <0>;
+	/* Explicit FCC/FV limits matching the M703 6000 mAh battery profile */
+	qcom,fcc-max-ua = <6000000>;
+	qcom,fv-max-uv = <4480000>;
+	/* USB ICL cap: 3 A on the main path; BQ CP supplies additional current */
+	qcom,usb-icl-ua = <3000000>;
+	/* USB-PD phandle for PPS/QC4+ negotiation */
+	qcom,usbpd-phandle = <&pm6150_pdphy>;
+	/* Enable Flash Charge (FFC): allows charging to 4.48 V */
+	mi,support-ffc;
+	/* Enable BQ2597x charge pump path for PPS fast charging */
+	mi,use-bq-pump;
+	/* Six-pin battery step-charge parameters (voltage_uV  current_uA) */
+	mi,six-pin-step-chg-params = <4250000 6000000
+				      4450000 5400000
+				      4480000 4000000>;
+	mi,six-pin-step-chg-params_2 = <4250000 6000000
+					4450000 5400000
+					4480000 4680000>;
+	mi,six-pin-step-chg;
+	/* Distinguish QC3 Class-A (18 W) vs Class-B (27 W) adapters */
+	qcom,distinguish-qc-class-ab;
+	/* Prevent spurious charging suspend on USBIN collapse glitches */
+	qcom,disable-suspend-on-collapse;
+	/* LPD (Liquid Presence Detection) not wired on Surya */
+	qcom,lpd-disable;
+};
+
+&pm6150_pdphy {
+	/* PPS control handled by BQ/pd_policy_manager, not by SMB stack */
+	mi,non-qcom-pps-ctrl;
+	/* Allow up to 5 A on verified PD contracts */
+	mi,pd_curr_limit = <1>;
+	mi,pd_max_curr_limit = <5000000>;
+	/* Cap unverified PPS VBUS to 9.5 V to protect against rogue adapters */
+	mi,limit_pd_unverified_pps_vbus = <1>;
+	mi,pd_unverified_pps_max_vbus_limit = <9500000>;
 };
 
 &pm6150_gpios {
