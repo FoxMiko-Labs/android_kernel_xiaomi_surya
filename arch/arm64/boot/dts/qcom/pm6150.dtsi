@@ -413,9 +413,10 @@
 					  "msg-rx-discarded",
 					  "fr-swap";
 
-			qcom,default-sink-caps = <5000 3000>, /* 5V @ 3A */
-						 <9000 3000>, /* 9V @ 3A */
-						 <12000 2250>; /* 12V @ 2.25A */
+			qcom,default-sink-caps = <5000 5000>, /* 5V @ 5A = 25W */
+						 <9000 3000>, /* 9V @ 3A = 27W */
+						 <12000 3000>, /* 12V @ 3A = 36W */
+						 <15000 3000>; /* 15V @ 3A = 45W */
 		};
 
 		pm6150_qg: qpnp,qg {
